@@ -2,17 +2,17 @@
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
+#include "MadgwickAHRS.h"
 
 Adafruit_MPU6050 mpu;
+Madgwick filter;
 
-// Variables for angle calculation
-float angleX = 0;
-float angleY = 0;
-float lastTime = 0;
+// Constants
+const float SAMPLE_FREQ = 100.0f; // Hz
+const float SAMPLE_TIME = 1000000.0f / SAMPLE_FREQ; // in microseconds
 
-// Complementary filter coefficient (0 < alpha < 1)
-// Higher alpha gives more weight to gyroscope
-const float alpha = 0.96;
+// Timing variables
+unsigned long lastUpdate = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -32,33 +32,38 @@ void setup() {
   // Set filter bandwidth
   mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);
 
-  lastTime = micros();
+  // Initialize Madgwick filter
+  filter.begin(SAMPLE_FREQ);
 }
 
 void loop() {
-  // Get current time
-  float currentTime = micros();
-  float dt = (currentTime - lastTime) / 1000000.0; // Convert to seconds
-  lastTime = currentTime;
+  unsigned long now = micros();
+  if ((now - lastUpdate) >= SAMPLE_TIME) {
+    lastUpdate = now;
 
-  // Get new sensor events with the readings
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+    // Get new sensor events with the readings
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
 
-  // Calculate angles from accelerometer
-  float accel_angleX = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
-  float accel_angleY = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI;
+    // Update Madgwick filter
+    filter.update(g.gyro.x,
+                 g.gyro.y,
+                 g.gyro.z,
+                 a.acceleration.x,
+                 a.acceleration.y,
+                 a.acceleration.z);
 
-  // Integrate gyroscope data
-  angleX = alpha * (angleX + g.gyro.x * dt * 180.0 / PI) + (1.0 - alpha) * accel_angleX;
-  angleY = alpha * (angleY + g.gyro.y * dt * 180.0 / PI) + (1.0 - alpha) * accel_angleY;
+    // Get Euler angles in degrees
+    float roll = filter.getRoll();
+    float pitch = filter.getPitch();
+    float yaw = filter.getYaw();
 
-  // Print estimated angles
-  Serial.print("Angle X: ");
-  Serial.print(angleX);
-  Serial.print(", Y: ");
-  Serial.println(angleY);
-
-  // Wait to achieve approximately 50Hz update rate
-  delay(20);
+    // Print angles
+    Serial.print("Roll: ");
+    Serial.print(roll);
+    Serial.print(", Pitch: ");
+    Serial.print(pitch);
+    Serial.print(", Yaw: ");
+    Serial.println(yaw);
+  }
 }
