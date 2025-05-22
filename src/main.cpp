@@ -3,9 +3,12 @@
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
 #include "MadgwickAHRS.h"
+#include "RCInput.h"
 
 Adafruit_MPU6050 mpu;
 Madgwick filter;
+RCInput rcRoll(2);  // Roll control on GPIO2
+RCInput rcPitch(3); // Pitch control on GPIO3
 
 // Constants
 const float SAMPLE_FREQ = 100.0f; // Hz
@@ -16,6 +19,10 @@ unsigned long lastUpdate = 0;
 
 void setup() {
   Serial.begin(115200);
+
+  // Initialize RC inputs
+  rcRoll.begin();
+  rcPitch.begin();
 
   // Try to initialize MPU6050
   if (!mpu.begin()) {
@@ -58,12 +65,25 @@ void loop() {
     float pitch = filter.getPitch();
     float yaw = filter.getYaw();
 
-    // Print angles
-    Serial.print("Roll: ");
+    // Get RC input angles
+    float rcRollAngle = rcRoll.getAngle();
+    float rcPitchAngle = rcPitch.getAngle();
+
+    // Print debug info
+    Serial.print("IMU:\t");
     Serial.print(roll);
-    Serial.print(", Pitch: ");
+    Serial.print("\t");
     Serial.print(pitch);
-    Serial.print(", Yaw: ");
-    Serial.println(yaw);
+    Serial.print("\t");
+    Serial.print(yaw);
+    Serial.print("\t RC:\t");
+    Serial.print(rcRollAngle);
+    Serial.print("(");
+    Serial.print(rcRoll.getPulseWidth());
+    Serial.print(")\t");
+    Serial.print(rcPitchAngle);
+    Serial.print("(");
+    Serial.print(rcPitch.getPulseWidth());
+    Serial.println(")");
   }
 }
