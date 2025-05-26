@@ -16,17 +16,49 @@ Madgwick filter;
 RCInput rcRoll(2);  // Roll control on GPIO2
 RCInput rcPitch(3); // Pitch control on GPIO3
 
+// Pin definitions
+const int BUZZER_PIN = 8;  // Buzzer connected to GPIO8
+
 // Constants
-const float SAMPLE_FREQ = 400.0f; // Hz - Increased for better response
+const float SAMPLE_FREQ = 400.0f; // Hz - Required for fast balance control
 const float SAMPLE_TIME = 1000000.0f / SAMPLE_FREQ; // in microseconds
-const unsigned long SERIAL_UPDATE_INTERVAL = 100000; // Print every 100ms
+const unsigned long SERIAL_UPDATE_INTERVAL = 20000; // Print every 20ms (50Hz)
 const unsigned long MOTOR_ENABLE_DELAY = 5000000; // 5 seconds in microseconds
+const unsigned long BUZZER_INTERVAL = 500000; // Beep every 500ms
+const unsigned long WARNING_START_TIME = 2000000; // Start warning 2 seconds after boot
+
+// Balance control constants
+const float DEG_PER_RAD = 57.2957795131f;  // 180/pi
+const float COMPLEMENTARY_FILTER_ALPHA = 0.96f;
+
+// PID constants
+const float PITCH_KP = 0.15f;   // Proportional gain
+const float PITCH_KI = 0.05f;   // Integral gain
+const float PITCH_KD = 0.02f;   // Derivative gain
+const float RATE_FF = 0.01f;    // Rate feedforward gain
+
+// Safety limits
+const float MAX_SAFE_PITCH = 45.0f;  // Maximum pitch angle before emergency stop
+const float MAX_MOTOR_SPEED = 2.0f;   // Maximum motor speed (-2.0 to +2.0)
 
 // Timing variables
 unsigned long lastUpdate = 0;
 unsigned long lastSerialUpdate = 0;
+unsigned long lastBuzzerToggle = 0;
 unsigned long startTime = 0;
 bool motorEnableFlag = false;
+bool buzzerState = false;
+
+// Balance control variables
+float pitchAngle = 0.0f;      // Current pitch angle in degrees
+float pitchRate = 0.0f;       // Current pitch rate in degrees/second
+float filteredPitch = 0.0f;   // Filtered pitch angle
+
+// PID control variables
+float pitchError = 0.0f;      // Current pitch error
+float pitchErrorSum = 0.0f;   // Integral of pitch error
+float lastPitchError = 0.0f;  // Previous pitch error
+float targetPitch = 0.0f;     // Target pitch angle (0 = upright)
 
 // Function declarations
 String sendODriveCommand(const char* command);
@@ -77,22 +109,19 @@ void setup() {
   Serial.begin(115200);
   startTime = micros();  // Record start time for motor enable delay
   
-  // Initialize ODrive serial communication
+  // Initialize buzzer pin and start warning sequence immediately
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(100);
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  // Initialize ODrive serial communication in background
   ODRIVE_SERIAL.setTX(ODRIVE_TX_PIN);
   ODRIVE_SERIAL.setRX(ODRIVE_RX_PIN);
   ODRIVE_SERIAL.begin(ODRIVE_BAUD_RATE);
-  delay(100);  // Wait for ODrive to initialize
-
-  Serial.println("Checking ODrive status...");
-  if (!checkODriveErrors()) {
-    Serial.println("ODrive reported errors. Please check the error codes above.");
-  } else {
-    Serial.println("ODrive initialized successfully!");
-  }
-
-  // Initialize RC inputs
-  rcRoll.begin();
-  rcPitch.begin();
+  
+  // Note: ODrive initialization and checks will be done in the loop
+  Serial.println("Starting up... Waiting for ODrive...");
 
   // Try to initialize MPU6050
   if (!mpu.begin()) {
@@ -109,8 +138,13 @@ void setup() {
   // Set filter bandwidth
   mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);
 
-  // Initialize Madgwick filter
-  filter.begin(SAMPLE_FREQ);
+  Serial.println("MPU6050 initialized successfully!");
+  Serial.println("Waiting for IMU calibration...");
+  
+  // Wait for IMU readings to stabilize
+  delay(2000);
+  
+  Serial.println("Starting balance control...");
 }
 
 void loop() {
@@ -122,80 +156,116 @@ void loop() {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
 
-    // Update Madgwick filter
-    filter.update(g.gyro.x,
-                 g.gyro.y,
-                 g.gyro.z,
-                 a.acceleration.x,
-                 a.acceleration.y,
-                 a.acceleration.z);
+    // Calculate pitch angle from accelerometer
+    float accelPitch = atan2f(a.acceleration.x, sqrtf(a.acceleration.y * a.acceleration.y + 
+                             a.acceleration.z * a.acceleration.z)) * DEG_PER_RAD;
 
-    // Get Euler angles in degrees
-    float roll = filter.getRoll();
-    float pitch = filter.getPitch();
-    float yaw = filter.getYaw();
+    // Get pitch rate from gyroscope (positive pitch is forward tilt)
+    pitchRate = -g.gyro.y * DEG_PER_RAD;  // Convert to deg/s
 
-    // Get RC input angles
-    float rcRollAngle = rcRoll.getAngle();
-    float rcPitchAngle = rcPitch.getAngle();
+    // Complementary filter for pitch angle
+    filteredPitch = COMPLEMENTARY_FILTER_ALPHA * (filteredPitch + pitchRate * (SAMPLE_TIME / 1000000.0f)) + 
+                   (1.0f - COMPLEMENTARY_FILTER_ALPHA) * accelPitch;
+    
+    // Store the filtered pitch for control
+    pitchAngle = filteredPitch;
 
-    // Check if it's time to enable motors
-    if (!motorEnableFlag && (now - startTime) >= MOTOR_ENABLE_DELAY) {
-      motorEnableFlag = true;
-      Serial.println("Motors enabled!");
+    // Handle warning buzzer and ODrive initialization
+    if (!motorEnableFlag) {
+      unsigned long timeElapsed = now - startTime;
+      
+      // Debug output for timing
+      if ((now - lastSerialUpdate) >= SERIAL_UPDATE_INTERVAL) {
+        Serial.print("Time: ");
+        Serial.print(timeElapsed / 1000000.0f, 1);
+        Serial.print("s ");
+      }
+      
+      // Start warning sequence immediately
+      if (timeElapsed < MOTOR_ENABLE_DELAY) {
+        // Toggle buzzer at specified interval
+        if ((now - lastBuzzerToggle) >= BUZZER_INTERVAL) {
+          lastBuzzerToggle = now;
+          buzzerState = !buzzerState;
+          digitalWrite(BUZZER_PIN, buzzerState);
+          
+          if ((now - lastSerialUpdate) >= SERIAL_UPDATE_INTERVAL) {
+            Serial.print(buzzerState ? "BEEP " : "STOP ");
+          }
+        }
+      }
+      
+      // Check if it's time to enable motors and ODrive is ready
+      if (timeElapsed >= MOTOR_ENABLE_DELAY) {
+        // Check ODrive status
+        if (!checkODriveErrors()) {
+          // If ODrive is not ready, keep beeping but don't enable motors
+          Serial.println("\nWaiting for ODrive... Check connections and errors.");
+          return;
+        }
+        
+        motorEnableFlag = true;
+        digitalWrite(BUZZER_PIN, LOW);  // Ensure buzzer is off
+        Serial.println("\nODrive ready - Motors enabled!");
+      }
     }
 
-    // Convert pitch and roll angles to motor velocities
-    float forwardVelocity = 0.0f;
-    float turnVelocity = 0.0f;
+    // Balance control
     if (motorEnableFlag) {
-      // Forward/backward motion from pitch (-90 to +90 degrees maps to -1 to +1)
-      forwardVelocity = constrain(rcPitchAngle / 90.0f, -1.0f, 1.0f);
-      // Turn motion from roll (-90 to +90 degrees maps to -0.5 to +0.5)
-      turnVelocity = constrain(rcRollAngle / 90.0f, -1.0f, 1.0f) * 0.5f;
-      
-      // Calculate differential drive velocities
-      float rightVelocity= forwardVelocity + turnVelocity;   // axis0
-      float leftVelocity = -(forwardVelocity - turnVelocity); // axis1 (inverted)
-      
-      // Constrain final velocities
-      leftVelocity = constrain(leftVelocity, -1.0f, 1.0f);
-      rightVelocity = constrain(rightVelocity, -1.0f, 1.0f);
-      
-      // Send commands to motors
-      setMotorVelocity(leftVelocity, 0);   // Left motor (axis0)
-      setMotorVelocity(rightVelocity, 1);  // Right motor (axis1)
+      // Safety check - disable motors if pitch is too large
+      if (abs(pitchAngle) > MAX_SAFE_PITCH) {
+        motorEnableFlag = false;
+        setMotorVelocity(0, 0);
+        setMotorVelocity(0, 1);
+        Serial.println("Emergency stop: Pitch angle too large!");
+      } else {
+        // Calculate PID control
+        pitchError = targetPitch - pitchAngle;
+        
+        // Update integral term with anti-windup
+        if (abs(pitchError) < 10.0f) {  // Only integrate small errors
+          pitchErrorSum += pitchError * (SAMPLE_TIME / 1000000.0f);
+          pitchErrorSum = constrain(pitchErrorSum, -10.0f, 10.0f);  // Limit integral windup
+        }
+        
+        // Calculate derivative term
+        float pitchErrorRate = (pitchError - lastPitchError) / (SAMPLE_TIME / 1000000.0f);
+        lastPitchError = pitchError;
+        
+        // Combine PID terms and rate feedforward
+        float controlOutput = PITCH_KP * pitchError +
+                            PITCH_KI * pitchErrorSum +
+                            PITCH_KD * pitchErrorRate +
+                            RATE_FF * pitchRate;
+        
+        // Limit motor speed
+        controlOutput = constrain(controlOutput, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
+        
+        // Apply control to both motors
+        setMotorVelocity(controlOutput, 0);
+        setMotorVelocity(-controlOutput, 1);  // Invert for axis1
+      }
     }
 
     // Print debug info only every SERIAL_UPDATE_INTERVAL
     if ((now - lastSerialUpdate) >= SERIAL_UPDATE_INTERVAL) {
       lastSerialUpdate = now;
-      Serial.print("IMU:\t");
-      // Serial.print(roll);
-      // Serial.print("\t");
-    Serial.print(pitch);
-      // Serial.print("\t");
-      // Serial.print(yaw);
-      // Serial.print("\t RC:\t");
-      // Serial.print(rcRollAngle);
-      // Serial.print("(");
-      // Serial.print(rcRoll.getPulseWidth());
-      // Serial.print(")\t");
-      // Serial.print(rcPitchAngle);
-      // Serial.print("(");
-      // Serial.print(rcPitch.getPulseWidth());
-      // Serial.print(")");
       
-      // Print motor status and velocities
-      Serial.print("\tMotors:");
+      // Print balance control data
+      Serial.print("P:");
+      Serial.print(pitchAngle, 1);
+      Serial.print("\tR:");
+      Serial.print(pitchRate, 1);
+      Serial.print("\tE:");
+      Serial.print(pitchError, 1);
+      Serial.print("\tI:");
+      Serial.print(pitchErrorSum, 1);
+      Serial.print("\tM:");
       Serial.print(motorEnableFlag ? "ON" : "OFF");
-      if (motorEnableFlag) {
-        Serial.print("\tFwd:");
-        Serial.print(forwardVelocity, 3);
-        Serial.print("\tTurn:");
-        Serial.print(turnVelocity, 3);
-      }
       Serial.println();
+
+      
+      
     }
   }
 }
