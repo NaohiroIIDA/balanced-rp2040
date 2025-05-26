@@ -17,12 +17,14 @@ RCInput rcRoll(2);  // Roll control on GPIO2
 RCInput rcPitch(3); // Pitch control on GPIO3
 
 // Constants
-const float SAMPLE_FREQ = 100.0f; // Hz
+const float SAMPLE_FREQ = 400.0f; // Hz - Increased for better response
 const float SAMPLE_TIME = 1000000.0f / SAMPLE_FREQ; // in microseconds
+const unsigned long SERIAL_UPDATE_INTERVAL = 100000; // Print every 100ms
 const unsigned long MOTOR_ENABLE_DELAY = 5000000; // 5 seconds in microseconds
 
 // Timing variables
 unsigned long lastUpdate = 0;
+unsigned long lastSerialUpdate = 0;
 unsigned long startTime = 0;
 bool motorEnableFlag = false;
 
@@ -41,8 +43,8 @@ String sendODriveCommand(const char* command) {
 // Function to set motor velocity
 void setMotorVelocity(float velocity, int axis) {
   char command[50];
-  snprintf(command, sizeof(command), "v %d %.3f", axis, velocity);
-  sendODriveCommand(command);
+  snprintf(command, sizeof(command), "v %d %.3f\n", axis, velocity);
+  ODRIVE_SERIAL.print(command);
 }
 
 // Function to check ODrive errors
@@ -143,38 +145,57 @@ void loop() {
       Serial.println("Motors enabled!");
     }
 
-    // Convert pitch angle to velocity (-90 to +90 degrees maps to -1 to +1)
-    float targetVelocity = 0.0f;
+    // Convert pitch and roll angles to motor velocities
+    float forwardVelocity = 0.0f;
+    float turnVelocity = 0.0f;
     if (motorEnableFlag) {
-      targetVelocity = constrain(rcPitchAngle / 90.0f, -1.0f, 1.0f);
-      setMotorVelocity(targetVelocity, 0);  // Set velocity for axis 0
-      setMotorVelocity(targetVelocity, 1);  // Set velocity for axis 1
+      // Forward/backward motion from pitch (-90 to +90 degrees maps to -1 to +1)
+      forwardVelocity = constrain(rcPitchAngle / 90.0f, -1.0f, 1.0f);
+      // Turn motion from roll (-90 to +90 degrees maps to -0.5 to +0.5)
+      turnVelocity = constrain(rcRollAngle / 90.0f, -1.0f, 1.0f) * 0.5f;
+      
+      // Calculate differential drive velocities
+      float rightVelocity= forwardVelocity + turnVelocity;   // axis0
+      float leftVelocity = -(forwardVelocity - turnVelocity); // axis1 (inverted)
+      
+      // Constrain final velocities
+      leftVelocity = constrain(leftVelocity, -1.0f, 1.0f);
+      rightVelocity = constrain(rightVelocity, -1.0f, 1.0f);
+      
+      // Send commands to motors
+      setMotorVelocity(leftVelocity, 0);   // Left motor (axis0)
+      setMotorVelocity(rightVelocity, 1);  // Right motor (axis1)
     }
 
-    // Print debug info
-    Serial.print("IMU:\t");
-    Serial.print(roll);
-    Serial.print("\t");
+    // Print debug info only every SERIAL_UPDATE_INTERVAL
+    if ((now - lastSerialUpdate) >= SERIAL_UPDATE_INTERVAL) {
+      lastSerialUpdate = now;
+      Serial.print("IMU:\t");
+      // Serial.print(roll);
+      // Serial.print("\t");
     Serial.print(pitch);
-    Serial.print("\t");
-    Serial.print(yaw);
-    Serial.print("\t RC:\t");
-    Serial.print(rcRollAngle);
-    Serial.print("(");
-    Serial.print(rcRoll.getPulseWidth());
-    Serial.print(")\t");
-    Serial.print(rcPitchAngle);
-    Serial.print("(");
-    Serial.print(rcPitch.getPulseWidth());
-    Serial.print(")");
-    
-    // Print motor status and velocity
-    Serial.print("\tMotors:");
-    Serial.print(motorEnableFlag ? "ON" : "OFF");
-    if (motorEnableFlag) {
-      Serial.print("\tVel:");
-      Serial.print(targetVelocity, 3);
+      // Serial.print("\t");
+      // Serial.print(yaw);
+      // Serial.print("\t RC:\t");
+      // Serial.print(rcRollAngle);
+      // Serial.print("(");
+      // Serial.print(rcRoll.getPulseWidth());
+      // Serial.print(")\t");
+      // Serial.print(rcPitchAngle);
+      // Serial.print("(");
+      // Serial.print(rcPitch.getPulseWidth());
+      // Serial.print(")");
+      
+      // Print motor status and velocities
+      Serial.print("\tMotors:");
+      Serial.print(motorEnableFlag ? "ON" : "OFF");
+      if (motorEnableFlag) {
+        Serial.print("\tFwd:");
+        Serial.print(forwardVelocity, 3);
+        Serial.print("\tTurn:");
+        Serial.print(turnVelocity, 3);
+      }
+      Serial.println();
     }
-    Serial.println();
   }
 }
