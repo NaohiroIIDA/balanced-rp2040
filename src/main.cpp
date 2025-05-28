@@ -5,6 +5,10 @@
 #include "MadgwickAHRS.h"
 #include "RCInput.h"
 
+// RC Input configuration
+#define RC_PITCH_PIN 2  // GPIO2 for pitch control
+RCInput rcPitch(RC_PITCH_PIN);
+
 // ODrive communication settings
 #define ODRIVE_SERIAL Serial1
 #define ODRIVE_BAUD_RATE 115200
@@ -13,8 +17,6 @@
 
 Adafruit_MPU6050 mpu;
 Madgwick filter;
-RCInput rcRoll(2);  // Roll control on GPIO2
-RCInput rcPitch(3); // Pitch control on GPIO3
 
 // Pin definitions
 const int BUZZER_PIN = 8;  // Buzzer connected to GPIO8
@@ -31,11 +33,15 @@ const unsigned long WARNING_START_TIME = 2000000; // Start warning 2 seconds aft
 const float DEG_PER_RAD = 57.2957795131f;  // 180/pi
 const float COMPLEMENTARY_FILTER_ALPHA = 0.96f;
 
-// PID constants
-const float PITCH_KP = 0.15f;   // Proportional gain
-const float PITCH_KI = 0.05f;   // Integral gain
-const float PITCH_KD = 0.02f;   // Derivative gain
-const float RATE_FF = 0.01f;    // Rate feedforward gain
+// Control parameters - now variable for tuning
+float pitchKp = 15.0f;  // Proportional gain
+float pitchKi = 1.0f;   // Integral gain
+float pitchKd = 0.3f;   // Derivative gain
+float rateFF = 0.8f;    // Rate feedforward gain
+float pitchOffset = 0.0f; // Gyro mounting offset compensation
+
+// RC control parameters
+const float RC_PITCH_SCALE = 0.2f;  // Scale RC input to ±0.2 degree pitch offset
 
 // Safety limits
 const float MAX_SAFE_PITCH = 45.0f;  // Maximum pitch angle before emergency stop
@@ -105,9 +111,70 @@ bool checkODriveErrors() {
           axis1Errors.toInt() == 0 && axis1MotorErrors.toInt() == 0 && axis1EncoderErrors.toInt() == 0);
 }
 
+// Debug print macros
+#ifdef DEBUG_ON
+  #define DEBUG_PRINT(...) Serial.print(__VA_ARGS__)
+  #define DEBUG_PRINTLN(...) Serial.println(__VA_ARGS__)
+#else
+  #define DEBUG_PRINT(...)
+  #define DEBUG_PRINTLN(...)
+#endif
+
+// Function to process serial commands
+void processSerialCommand() {
+  if (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    
+    // Parse command and value
+    int spaceIndex = cmd.indexOf(' ');
+    if (spaceIndex == -1) {
+      // Commands without parameters
+      if (cmd == "status") {
+        Serial.println("Current parameters:");
+        Serial.print("Kp:"); Serial.println(pitchKp, 3);
+        Serial.print("Ki:"); Serial.println(pitchKi, 3);
+        Serial.print("Kd:"); Serial.println(pitchKd, 3);
+        Serial.print("FF:"); Serial.println(rateFF, 3);
+        Serial.print("Offset:"); Serial.println(pitchOffset, 3);
+      }
+      return;
+    }
+    
+    String command = cmd.substring(0, spaceIndex);
+    float value = cmd.substring(spaceIndex + 1).toFloat();
+    
+    // Process commands with parameters
+    if (command == "kp") {
+      pitchKp = value;
+      Serial.print("Set Kp to "); Serial.println(value, 3);
+    }
+    else if (command == "ki") {
+      pitchKi = value;
+      Serial.print("Set Ki to "); Serial.println(value, 3);
+    }
+    else if (command == "kd") {
+      pitchKd = value;
+      Serial.print("Set Kd to "); Serial.println(value, 3);
+    }
+    else if (command == "ff") {
+      rateFF = value;
+      Serial.print("Set FF to "); Serial.println(value, 3);
+    }
+    else if (command == "offset") {
+      pitchOffset = value;
+      Serial.print("Set pitch offset to "); Serial.println(value, 3);
+    }
+  }
+}
+
 void setup() {
+  // Initialize serial communication
   Serial.begin(115200);
   startTime = micros();  // Record start time for motor enable delay
+  
+  // Initialize RC input
+  rcPitch.begin();
   
   // Initialize buzzer pin and start warning sequence immediately
   pinMode(BUZZER_PIN, OUTPUT);
@@ -120,12 +187,21 @@ void setup() {
   ODRIVE_SERIAL.setRX(ODRIVE_RX_PIN);
   ODRIVE_SERIAL.begin(ODRIVE_BAUD_RATE);
   
+  // Print available commands
+  Serial.println("Available commands:");
+  Serial.println("status - Show current parameters");
+  Serial.println("kp <value> - Set proportional gain");
+  Serial.println("ki <value> - Set integral gain");
+  Serial.println("kd <value> - Set derivative gain");
+  Serial.println("ff <value> - Set rate feedforward gain");
+  Serial.println("offset <value> - Set pitch offset");
+  
   // Note: ODrive initialization and checks will be done in the loop
-  Serial.println("Starting up... Waiting for ODrive...");
+  DEBUG_PRINTLN("Starting up... Waiting for ODrive...");
 
   // Try to initialize MPU6050
   if (!mpu.begin()) {
-    Serial.println("Failed to find MPU6050 chip");
+    DEBUG_PRINTLN("Failed to find MPU6050 chip");
     while (1) {
       delay(10);
     }
@@ -138,16 +214,17 @@ void setup() {
   // Set filter bandwidth
   mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);
 
-  Serial.println("MPU6050 initialized successfully!");
-  Serial.println("Waiting for IMU calibration...");
+  DEBUG_PRINTLN("MPU6050 initialized successfully!");
+  DEBUG_PRINTLN("Waiting for IMU calibration...");
   
   // Wait for IMU readings to stabilize
   delay(2000);
   
-  Serial.println("Starting balance control...");
+  DEBUG_PRINTLN("Starting balance control...");
 }
 
 void loop() {
+  processSerialCommand();
   unsigned long now = micros();
   if ((now - lastUpdate) >= SAMPLE_TIME) {
     lastUpdate = now;
@@ -167,8 +244,21 @@ void loop() {
     filteredPitch = COMPLEMENTARY_FILTER_ALPHA * (filteredPitch + pitchRate * (SAMPLE_TIME / 1000000.0f)) + 
                    (1.0f - COMPLEMENTARY_FILTER_ALPHA) * accelPitch;
     
-    // Store the filtered pitch for control
-    pitchAngle = filteredPitch;
+    // Get RC pitch input and scale to ±1 degree
+    float rcPitchOffset = 0.0f;
+    if (rcPitch.hasNewData()) {
+      rcPitchOffset = rcPitch.getAngle() * (RC_PITCH_SCALE / 90.0f);  // Scale from ±90 to ±1 degree
+      rcPitch.clearNewData();
+      
+      if ((now - lastSerialUpdate) >= SERIAL_UPDATE_INTERVAL) {
+        DEBUG_PRINT("RC:");
+        DEBUG_PRINT(rcPitchOffset, 2);
+        DEBUG_PRINT("\t");
+      }
+    }
+    
+    // Store the filtered pitch plus RC offset and mounting offset for control
+    pitchAngle = filteredPitch + rcPitchOffset + pitchOffset;
 
     // Handle warning buzzer and ODrive initialization
     if (!motorEnableFlag) {
@@ -176,9 +266,9 @@ void loop() {
       
       // Debug output for timing
       if ((now - lastSerialUpdate) >= SERIAL_UPDATE_INTERVAL) {
-        Serial.print("Time: ");
-        Serial.print(timeElapsed / 1000000.0f, 1);
-        Serial.print("s ");
+        DEBUG_PRINT("Time: ");
+        DEBUG_PRINT(timeElapsed / 1000000.0f, 1);
+        DEBUG_PRINT("s ");
       }
       
       // Start warning sequence immediately
@@ -190,7 +280,7 @@ void loop() {
           digitalWrite(BUZZER_PIN, buzzerState);
           
           if ((now - lastSerialUpdate) >= SERIAL_UPDATE_INTERVAL) {
-            Serial.print(buzzerState ? "BEEP " : "STOP ");
+            DEBUG_PRINT(buzzerState ? "BEEP " : "STOP ");
           }
         }
       }
@@ -200,13 +290,13 @@ void loop() {
         // Check ODrive status
         if (!checkODriveErrors()) {
           // If ODrive is not ready, keep beeping but don't enable motors
-          Serial.println("\nWaiting for ODrive... Check connections and errors.");
+          DEBUG_PRINTLN("\nWaiting for ODrive... Check connections and errors.");
           return;
         }
         
         motorEnableFlag = true;
         digitalWrite(BUZZER_PIN, LOW);  // Ensure buzzer is off
-        Serial.println("\nODrive ready - Motors enabled!");
+        DEBUG_PRINTLN("\nODrive ready - Motors enabled!");
       }
     }
 
@@ -217,7 +307,7 @@ void loop() {
         motorEnableFlag = false;
         setMotorVelocity(0, 0);
         setMotorVelocity(0, 1);
-        Serial.println("Emergency stop: Pitch angle too large!");
+        DEBUG_PRINTLN("Emergency stop: Pitch angle too large!");
       } else {
         // Calculate PID control
         pitchError = targetPitch - pitchAngle;
@@ -233,10 +323,10 @@ void loop() {
         lastPitchError = pitchError;
         
         // Combine PID terms and rate feedforward
-        float controlOutput = PITCH_KP * pitchError +
-                            PITCH_KI * pitchErrorSum +
-                            PITCH_KD * pitchErrorRate +
-                            RATE_FF * pitchRate;
+        float controlOutput = pitchKp * pitchError +
+                            pitchKi * pitchErrorSum +
+                            pitchKd * pitchErrorRate +
+                            rateFF * pitchRate;
         
         // Limit motor speed
         controlOutput = constrain(controlOutput, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
@@ -252,17 +342,17 @@ void loop() {
       lastSerialUpdate = now;
       
       // Print balance control data
-      Serial.print("P:");
-      Serial.print(pitchAngle, 1);
-      Serial.print("\tR:");
-      Serial.print(pitchRate, 1);
-      Serial.print("\tE:");
-      Serial.print(pitchError, 1);
-      Serial.print("\tI:");
-      Serial.print(pitchErrorSum, 1);
-      Serial.print("\tM:");
-      Serial.print(motorEnableFlag ? "ON" : "OFF");
-      Serial.println();
+      DEBUG_PRINT("P:");
+      DEBUG_PRINT(pitchAngle, 1);
+      DEBUG_PRINT("\tR:");
+      DEBUG_PRINT(pitchRate, 1);
+      DEBUG_PRINT("\tE:");
+      DEBUG_PRINT(pitchError, 1);
+      DEBUG_PRINT("\tI:");
+      DEBUG_PRINT(pitchErrorSum, 1);
+      DEBUG_PRINT("\tM:");
+      DEBUG_PRINT(motorEnableFlag ? "ON" : "OFF");
+      DEBUG_PRINTLN("");
 
       
       
