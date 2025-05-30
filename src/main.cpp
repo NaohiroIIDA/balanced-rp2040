@@ -24,7 +24,7 @@ const int BUZZER_PIN = 8;  // Buzzer connected to GPIO8
 // Constants
 const float SAMPLE_FREQ = 400.0f; // Hz - Required for fast balance control
 const float SAMPLE_TIME = 1000000.0f / SAMPLE_FREQ; // in microseconds
-const unsigned long SERIAL_UPDATE_INTERVAL = 20000; // Print every 20ms (50Hz)
+const unsigned long SERIAL_UPDATE_INTERVAL = 100000; // Print every 100ms (10Hz)
 const unsigned long MOTOR_ENABLE_DELAY = 5000000; // 5 seconds in microseconds
 const unsigned long BUZZER_INTERVAL = 500000; // Beep every 500ms
 const unsigned long WARNING_START_TIME = 2000000; // Start warning 2 seconds after boot
@@ -54,6 +54,7 @@ unsigned long lastBuzzerToggle = 0;
 unsigned long startTime = 0;
 bool motorEnableFlag = false;
 bool buzzerState = false;
+bool isControlEnabled = true;  // 制御状態を管理
 
 // Balance control variables
 float pitchAngle = 0.0f;      // Current pitch angle in degrees
@@ -74,8 +75,11 @@ void setMotorVelocity(float velocity, int axis);
 String sendODriveCommand(const char* command) {
   ODRIVE_SERIAL.print(command);
   ODRIVE_SERIAL.print("\n");
-  String response = ODRIVE_SERIAL.readStringUntil('\n');
-  return response;
+  // Clear any response without blocking
+  while (ODRIVE_SERIAL.available()) {
+    ODRIVE_SERIAL.read();
+  }
+  return "OK"; // Non-blocking operation, no response needed
 }
 
 // Function to set motor velocity
@@ -123,6 +127,11 @@ bool checkODriveErrors() {
 // Function to process serial commands
 void processSerialCommand() {
   if (Serial.available() > 0) {
+    // シリアル入力があった時点でモータを停止
+    isControlEnabled = false;
+    setMotorVelocity(0, 0);
+    setMotorVelocity(1, 0);
+    
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
     
@@ -137,6 +146,9 @@ void processSerialCommand() {
         Serial.print("Kd:"); Serial.println(pitchKd, 3);
         Serial.print("FF:"); Serial.println(rateFF, 3);
         Serial.print("Offset:"); Serial.println(pitchOffset, 3);
+        Serial.print("Control:"); Serial.println(isControlEnabled ? "Enabled" : "Disabled");
+        // パラメータ確認後に制御を再開
+        isControlEnabled = true;
       }
       return;
     }
@@ -161,9 +173,21 @@ void processSerialCommand() {
       rateFF = value;
       Serial.print("Set FF to "); Serial.println(value, 3);
     }
+    else if (command == "start") {
+      isControlEnabled = true;
+      Serial.println("Control enabled");
+    }
+    else if (command == "stop") {
+      isControlEnabled = false;
+      setMotorVelocity(0, 0);
+      setMotorVelocity(1, 0);
+      Serial.println("Control disabled");
+    }
     else if (command == "offset") {
       pitchOffset = value;
       Serial.print("Set pitch offset to "); Serial.println(value, 3);
+      // パラメータ設定後に制御を再開
+      isControlEnabled = true;
     }
   }
 }
@@ -195,6 +219,8 @@ void setup() {
   Serial.println("kd <value> - Set derivative gain");
   Serial.println("ff <value> - Set rate feedforward gain");
   Serial.println("offset <value> - Set pitch offset");
+  Serial.println("start - Enable balance control");
+  Serial.println("stop - Disable balance control");
   
   // Note: ODrive initialization and checks will be done in the loop
   DEBUG_PRINTLN("Starting up... Waiting for ODrive...");
@@ -226,7 +252,7 @@ void setup() {
 void loop() {
   processSerialCommand();
   unsigned long now = micros();
-  if ((now - lastUpdate) >= SAMPLE_TIME) {
+  if (isControlEnabled && now - lastUpdate >= SAMPLE_TIME) {
     lastUpdate = now;
 
     // Get new sensor events with the readings
